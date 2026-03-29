@@ -66,16 +66,12 @@ export class McpServerAdapter {
     });
 
     app.post(messagePath, async (req: Request, res: Response) => {
-      const sessionId = String(req.query.sessionId ?? "");
-      const session = this.sseSessions.get(sessionId);
-      if (!session) {
-        res.status(400).json({
-          error: `Unknown sessionId: ${sessionId}`,
-        });
-        return;
-      }
+      await this.handleSsePost(req, res);
+    });
 
-      await session.transport.handlePostMessage(req, res);
+    // Compatibility endpoint: some clients probe POST /sse before switching to legacy SSE flow.
+    app.post(ssePath, async (req: Request, res: Response) => {
+      await this.handleSsePost(req, res);
     });
 
     await new Promise<void>((resolve) => {
@@ -83,6 +79,21 @@ export class McpServerAdapter {
         resolve();
       });
     });
+  }
+
+  private async handleSsePost(req: Request, res: Response): Promise<void> {
+    const sessionId = String(req.query.sessionId ?? "");
+    const session = this.sseSessions.get(sessionId);
+    if (!session) {
+      res.status(400).json({
+        error: `Unknown sessionId: ${sessionId}`,
+        hint: "Open GET /sse first and then POST to the endpoint returned by the 'endpoint' SSE event.",
+      });
+      return;
+    }
+
+    const parsedBody = req.body === undefined ? undefined : req.body;
+    await session.transport.handlePostMessage(req, res, parsedBody);
   }
 
   private createServer(): Server {

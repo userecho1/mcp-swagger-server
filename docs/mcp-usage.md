@@ -67,6 +67,31 @@ $env:TRANSPORT='sse'; $env:PORT='3001'; $env:SPEC_URL='http://localhost:8080/v3/
 }
 ```
 
+如果你的客户端使用 `type` 字段，可等价写为：
+
+```json
+{
+  "mcpServers": {
+    "swagger-sse": {
+      "type": "sse",
+      "url": "http://localhost:3001/sse"
+    }
+  }
+}
+```
+
+### 2.3 关于 `404 status sending message to /sse`
+
+- 这通常是客户端先尝试新的 HTTP 模式，再自动回退到 legacy SSE 的探测日志。
+- 只要随后能够成功建立 SSE 并拿到 `endpoint` 事件，通常不影响使用。
+- 当前服务端已增加 `POST /sse` 兼容入口，避免直接 404。
+
+### 2.4 关于 `400 ... stream is not readable`
+
+- 根因通常是服务端已启用 JSON body parser，导致请求流被提前消费，SDK 再次读取时失败。
+- 当前版本已在 SSE 路由将 `req.body` 直接传入 SDK，避免二次读取流。
+- 若仍出现该提示，优先确认启动的是最新构建：先执行 `npm run build`，再执行启动命令。
+
 ## 3. 使用顺序建议
 
 1. 先确认 Spring Boot 可访问：
