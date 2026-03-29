@@ -18,23 +18,36 @@ const HTTP_METHODS: HttpMethod[] = [
   "head",
 ];
 
+const REQUEST_BODY_CONTENT_TYPE_PRIORITY = [
+  "application/json",
+  "application/x-www-form-urlencoded",
+  "multipart/form-data",
+] as const;
+
 export class SpecParser {
+  private currentSpec?: OpenApiSpec;
+
   parse(spec: OpenApiSpec): McpTool[] {
+    this.currentSpec = spec;
     const tools: McpTool[] = [];
 
-    for (const [path, pathItem] of Object.entries(spec.paths ?? {})) {
-      for (const method of HTTP_METHODS) {
-        const operation = pathItem[method];
-        if (!operation) {
-          continue;
+    try {
+      for (const [path, pathItem] of Object.entries(spec.paths ?? {})) {
+        for (const method of HTTP_METHODS) {
+          const operation = pathItem[method];
+          if (!operation) {
+            continue;
+          }
+
+          const normalized = this.normalizeOperation(path, method, operation, pathItem.parameters ?? []);
+          tools.push(normalized);
         }
-
-        const normalized = this.normalizeOperation(path, method, operation, pathItem.parameters ?? []);
-        tools.push(normalized);
       }
-    }
 
-    return tools;
+      return tools;
+    } finally {
+      this.currentSpec = undefined;
+    }
   }
 
   private normalizeOperation(
@@ -73,13 +86,17 @@ export class SpecParser {
     let requestBodyContentType: string | undefined;
 
     const requestBody = operation.requestBody;
-    const jsonBodySchema = requestBody?.content?.["application/json"]?.schema;
-    if (jsonBodySchema) {
+    const bodySelection = this.selectRequestBodySchema(requestBody?.content);
+    if (bodySelection) {
       requestBodyArgName = this.uniqueArgName("body", usedArgNames);
-      requestBodyContentType = "application/json";
-      const zodSchema = this.mapSchemaToZod(jsonBodySchema);
+      requestBodyContentType = bodySelection.contentType;
+      const normalizedBodySchema = this.normalizeRequestBodySchema(
+        bodySelection.schema,
+        bodySelection.contentType,
+      );
+      const zodSchema = this.mapSchemaToZod(normalizedBodySchema);
       shape[requestBodyArgName] = requestBody?.required ? zodSchema : zodSchema.optional();
-      jsonProperties[requestBodyArgName] = this.toJsonSchema(jsonBodySchema);
+      jsonProperties[requestBodyArgName] = this.toJsonSchema(normalizedBodySchema);
       if (requestBody?.required) {
         required.push(requestBodyArgName);
       }
@@ -121,12 +138,13 @@ export class SpecParser {
   }
 
   private mapSchemaToZod(schema?: OpenApiSchema): z.ZodTypeAny {
-    if (!schema) {
+    const resolvedSchema = this.resolveSchema(schema);
+    if (!resolvedSchema) {
       return z.any();
     }
 
-    if (schema.enum && schema.enum.length > 0) {
-      const literals = schema.enum.map((item) => z.literal(item));
+    if (resolvedSchema.enum && resolvedSchema.enum.length > 0) {
+      const literals = resolvedSchema.enum.map((item) => z.literal(item));
       if (literals.length === 1) {
         return literals[0];
       }
@@ -134,22 +152,22 @@ export class SpecParser {
       return z.union([first, second, ...rest]);
     }
 
-    switch (schema.type) {
+    switch (resolvedSchema.type) {
       case "string":
-        return z.string();
+        return z.coerce.string();
       case "integer":
-        return z.number().int();
+        return z.coerce.number().int();
       case "number":
-        return z.number();
+        return z.coerce.number();
       case "boolean":
-        return z.boolean();
+        return z.coerce.boolean();
       case "array": {
-        const itemSchema = this.mapSchemaToZod(schema.items);
+        const itemSchema = this.mapSchemaToZod(resolvedSchema.items);
         return z.array(itemSchema);
       }
       case "object": {
-        const properties = schema.properties ?? {};
-        const required = new Set(schema.required ?? []);
+        const properties = resolvedSchema.properties ?? {};
+        const required = new Set(resolvedSchema.required ?? []);
         const childShape: z.ZodRawShape = {};
 
         for (const [key, childSchema] of Object.entries(properties)) {
@@ -157,63 +175,198 @@ export class SpecParser {
           childShape[key] = required.has(key) ? child : child.optional();
         }
 
-        return z.object(childShape);
+        const hasProperties = Object.keys(properties).length > 0;
+        const additional = resolvedSchema.additionalProperties;
+        const resolvedAdditional =
+          additional && typeof additional === "object" ? this.resolveSchema(additional) : undefined;
+
+        if (!hasProperties) {
+          if (this.isLooseObjectSchema(resolvedAdditional)) {
+            return z.record(z.any());
+          }
+          if (resolvedAdditional) {
+            return z.record(this.mapSchemaToZod(resolvedAdditional));
+          }
+          if (additional === true || additional === undefined) {
+            return z.record(z.any());
+          }
+          return z.object({}).strict();
+        }
+
+        const objectSchema = z.object(childShape);
+        if (this.isLooseObjectSchema(resolvedAdditional)) {
+          return objectSchema.catchall(z.any());
+        }
+        if (resolvedAdditional) {
+          return objectSchema.catchall(this.mapSchemaToZod(resolvedAdditional));
+        }
+        if (additional === true) {
+          return objectSchema.catchall(z.any());
+        }
+        if (additional === false) {
+          return objectSchema.strict();
+        }
+
+        return objectSchema;
       }
       default:
         return z.any();
     }
   }
 
+  private selectRequestBodySchema(
+    content?: Record<string, { schema?: OpenApiSchema }>,
+  ): { contentType: string; schema: OpenApiSchema } | undefined {
+    if (!content) {
+      return undefined;
+    }
+
+    for (const preferredType of REQUEST_BODY_CONTENT_TYPE_PRIORITY) {
+      const schema = content[preferredType]?.schema;
+      if (schema) {
+        return {
+          contentType: preferredType,
+          schema,
+        };
+      }
+    }
+
+    for (const [contentType, mediaType] of Object.entries(content)) {
+      if (mediaType.schema) {
+        return {
+          contentType,
+          schema: mediaType.schema,
+        };
+      }
+
+      // Some generators omit schema for form bodies; provide a permissive fallback.
+      if (contentType === "application/x-www-form-urlencoded" || contentType === "multipart/form-data") {
+        return {
+          contentType,
+          schema: {
+            type: "object",
+            additionalProperties: true,
+          },
+        };
+      }
+    }
+
+    return undefined;
+  }
+
   private toJsonSchema(schema?: OpenApiSchema): Record<string, unknown> {
-    if (!schema) {
+    const resolvedSchema = this.resolveSchema(schema);
+    if (!resolvedSchema) {
       return {};
     }
 
     const jsonSchema: Record<string, unknown> = {};
-    if (schema.type) {
-      jsonSchema.type = schema.type;
+    if (resolvedSchema.type) {
+      jsonSchema.type = resolvedSchema.type;
     }
-    if (schema.description) {
-      jsonSchema.description = schema.description;
+    if (resolvedSchema.description) {
+      jsonSchema.description = resolvedSchema.description;
     }
-    if (schema.enum) {
-      jsonSchema.enum = schema.enum;
+    if (resolvedSchema.enum) {
+      jsonSchema.enum = resolvedSchema.enum;
     }
-    if (schema.default !== undefined) {
-      jsonSchema.default = schema.default;
+    if (resolvedSchema.default !== undefined) {
+      jsonSchema.default = resolvedSchema.default;
     }
-    if (schema.format) {
-      jsonSchema.format = schema.format;
+    if (resolvedSchema.format) {
+      jsonSchema.format = resolvedSchema.format;
     }
-    if (schema.nullable) {
+    if (resolvedSchema.nullable) {
       const currentType = jsonSchema.type;
       if (typeof currentType === "string") {
         jsonSchema.type = [currentType, "null"];
       }
     }
 
-    if (schema.type === "array") {
-      jsonSchema.items = this.toJsonSchema(schema.items);
+    if (resolvedSchema.type === "array") {
+      jsonSchema.items = this.toJsonSchema(resolvedSchema.items);
     }
 
-    if (schema.type === "object") {
-      const properties = schema.properties ?? {};
+    if (resolvedSchema.type === "object") {
+      const properties = resolvedSchema.properties ?? {};
       const jsonProperties: Record<string, unknown> = {};
       for (const [key, childSchema] of Object.entries(properties)) {
         jsonProperties[key] = this.toJsonSchema(childSchema);
       }
       jsonSchema.properties = jsonProperties;
-      if (schema.required && schema.required.length > 0) {
-        jsonSchema.required = schema.required;
+      if (resolvedSchema.required && resolvedSchema.required.length > 0) {
+        jsonSchema.required = resolvedSchema.required;
       }
-      if (typeof schema.additionalProperties === "boolean") {
-        jsonSchema.additionalProperties = schema.additionalProperties;
-      } else if (schema.additionalProperties) {
-        jsonSchema.additionalProperties = this.toJsonSchema(schema.additionalProperties);
+      if (typeof resolvedSchema.additionalProperties === "boolean") {
+        jsonSchema.additionalProperties = resolvedSchema.additionalProperties;
+      } else if (resolvedSchema.additionalProperties) {
+        const resolvedAdditional = this.resolveSchema(resolvedSchema.additionalProperties);
+        jsonSchema.additionalProperties = this.isLooseObjectSchema(resolvedAdditional)
+          ? true
+          : this.toJsonSchema(resolvedAdditional);
       }
     }
 
     return jsonSchema;
+  }
+
+  private normalizeRequestBodySchema(schema: OpenApiSchema, contentType: string): OpenApiSchema {
+    const resolved = this.resolveSchema(schema) ?? schema;
+
+    if (contentType === "application/x-www-form-urlencoded" || contentType === "multipart/form-data") {
+      return {
+        type: "object",
+        additionalProperties: {
+          type: "string",
+        },
+      };
+    }
+
+    if (contentType === "application/json" && resolved.type === "object") {
+      const hasProperties = !!resolved.properties && Object.keys(resolved.properties).length > 0;
+      const additional = resolved.additionalProperties;
+      const resolvedAdditional =
+        additional && typeof additional === "object" ? this.resolveSchema(additional) : undefined;
+
+      if (!hasProperties && resolvedAdditional && this.isLooseObjectSchema(resolvedAdditional)) {
+        return {
+          ...resolved,
+          additionalProperties: true,
+        };
+      }
+    }
+
+    return resolved;
+  }
+
+  private resolveSchema(schema?: OpenApiSchema): OpenApiSchema | undefined {
+    if (!schema) {
+      return undefined;
+    }
+
+    if (!schema.$ref) {
+      return schema;
+    }
+
+    if (!schema.$ref.startsWith("#/components/schemas/")) {
+      return schema;
+    }
+
+    const schemaName = schema.$ref.replace("#/components/schemas/", "");
+    const resolved = this.currentSpec?.components?.schemas?.[schemaName];
+    return resolved ?? schema;
+  }
+
+  private isLooseObjectSchema(schema?: OpenApiSchema): boolean {
+    if (!schema) {
+      return false;
+    }
+    if (schema.type !== "object") {
+      return false;
+    }
+    const hasProperties = !!schema.properties && Object.keys(schema.properties).length > 0;
+    const hasAdditional = schema.additionalProperties !== undefined;
+    return !hasProperties && !hasAdditional;
   }
 
   private buildOperationId(path: string, method: HttpMethod): string {

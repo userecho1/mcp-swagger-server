@@ -8,6 +8,7 @@ export type HttpMethod =
   | "head";
 
 export interface OpenApiSchema {
+  $ref?: string;
   type?: string;
   format?: string;
   description?: string;
@@ -52,6 +53,9 @@ export interface OpenApiSpec {
     title?: string;
     version?: string;
     description?: string;
+  };
+  components?: {
+    schemas?: Record<string, OpenApiSchema>;
   };
   paths: Record<string, OpenApiPathItem>;
 }

@@ -48,21 +48,56 @@ export class AxiosBackendInvoker implements BackendInvoker {
     if (this.config.apiToken) {
       headers.Authorization = `Bearer ${this.config.apiToken}`;
     }
-    if (operation.requestBodyContentType) {
+    if (operation.requestBodyContentType && operation.requestBodyContentType !== "multipart/form-data") {
       headers["Content-Type"] = operation.requestBodyContentType;
     }
 
     const bodyArgName = operation.requestBodyArgName;
-    const data = bodyArgName ? args[bodyArgName] : undefined;
+    const rawBody = bodyArgName ? args[bodyArgName] : undefined;
+    const data = this.serializeBody(rawBody, operation.requestBodyContentType);
 
-    const response = await this.client.request({
-      method: operation.method as Method,
-      url: resolvedPath,
-      params: query,
-      headers,
-      data,
-    });
+    try {
+      const response = await this.client.request({
+        method: operation.method as Method,
+        url: resolvedPath,
+        params: query,
+        headers,
+        data,
+      });
 
-    return response.data;
+      return response.data;
+    } catch (error) {
+      if (axios.isAxiosError(error)) {
+        const status = error.response?.status;
+        const responseData = error.response?.data;
+        const detail = responseData === undefined ? "" : `, response: ${JSON.stringify(responseData)}`;
+        throw new Error(`Request failed${status ? ` with status ${status}` : ""}${detail}`);
+      }
+
+      throw error;
+    }
+  }
+
+  private serializeBody(body: unknown, contentType?: string): unknown {
+    if (body === undefined || body === null) {
+      return body;
+    }
+
+    if (contentType === "application/x-www-form-urlencoded") {
+      if (typeof body !== "object" || Array.isArray(body)) {
+        return body;
+      }
+
+      const params = new URLSearchParams();
+      for (const [key, value] of Object.entries(body as Record<string, unknown>)) {
+        if (value === undefined || value === null) {
+          continue;
+        }
+        params.append(key, String(value));
+      }
+      return params;
+    }
+
+    return body;
   }
 }

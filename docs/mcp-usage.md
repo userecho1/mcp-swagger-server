@@ -100,3 +100,34 @@ $env:TRANSPORT='sse'; $env:PORT='3001'; $env:SPEC_URL='http://localhost:8080/v3/
 2. 选择一种方式启动 MCP Server（stdio 或 SSE）。
 3. 在 MCP 客户端中填入对应 JSON 配置并连接。
 4. 检查工具列表是否包含 hello，再执行测试调用。
+
+## 4. 参数格式示例（重点）
+
+`/api/echo/body` 与 `/api/echo/form` 在 MCP 调用时都建议使用 `body` 字段包裹请求体。
+
+### 4.1 echo body
+
+```json
+{
+  "body": {
+    "source": "inspector",
+    "ok": true,
+    "n": 1
+  }
+}
+```
+
+### 4.2 echo form
+
+```json
+{
+  "body": {
+    "a": "1",
+    "b": "x"
+  }
+}
+```
+
+说明：
+- `echo/form` 会由服务端自动序列化为 `application/x-www-form-urlencoded`。
+- 如果后端返回 400，优先检查是否遗漏 `body` 包裹层以及字段值是否可被转为字符串。
