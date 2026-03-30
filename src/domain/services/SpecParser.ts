@@ -26,9 +26,16 @@ const REQUEST_BODY_CONTENT_TYPE_PRIORITY = [
 
 export class SpecParser {
   private currentSpec?: OpenApiSpec;
+  private zodSchemaCache = new Map<string, z.ZodTypeAny>();
+  private jsonSchemaCache = new Map<string, Record<string, unknown>>();
+  private inProgressZodCache = new Set<string>();
+  private inProgressJsonCache = new Set<string>();
+  private schemaObjectIds = new WeakMap<OpenApiSchema, number>();
+  private schemaObjectIdSequence = 0;
 
   parse(spec: OpenApiSpec): McpTool[] {
     this.currentSpec = spec;
+    this.resetSchemaCaches();
     const tools: McpTool[] = [];
 
     try {
@@ -47,6 +54,7 @@ export class SpecParser {
       return tools;
     } finally {
       this.currentSpec = undefined;
+      this.resetSchemaCaches();
     }
   }
 
@@ -143,75 +151,110 @@ export class SpecParser {
       return z.any();
     }
 
+    const cacheKey = this.getSchemaCacheKey(schema, resolvedSchema);
+    if (cacheKey) {
+      const cached = this.zodSchemaCache.get(cacheKey);
+      if (cached) {
+        return cached;
+      }
+      if (this.inProgressZodCache.has(cacheKey)) {
+        return z.lazy(() => this.zodSchemaCache.get(cacheKey) ?? z.any());
+      }
+      this.inProgressZodCache.add(cacheKey);
+    }
+
+    let built: z.ZodTypeAny;
     if (resolvedSchema.enum && resolvedSchema.enum.length > 0) {
       const literals = resolvedSchema.enum.map((item) => z.literal(item));
       if (literals.length === 1) {
-        return literals[0];
+        built = literals[0];
+      } else {
+        const [first, second, ...rest] = literals;
+        built = z.union([first, second, ...rest]);
       }
-      const [first, second, ...rest] = literals;
-      return z.union([first, second, ...rest]);
-    }
-
-    switch (resolvedSchema.type) {
-      case "string":
-        return z.coerce.string();
-      case "integer":
-        return z.coerce.number().int();
-      case "number":
-        return z.coerce.number();
-      case "boolean":
-        return z.coerce.boolean();
-      case "array": {
-        const itemSchema = this.mapSchemaToZod(resolvedSchema.items);
-        return z.array(itemSchema);
-      }
-      case "object": {
-        const properties = resolvedSchema.properties ?? {};
-        const required = new Set(resolvedSchema.required ?? []);
-        const childShape: z.ZodRawShape = {};
-
-        for (const [key, childSchema] of Object.entries(properties)) {
-          const child = this.mapSchemaToZod(childSchema);
-          childShape[key] = required.has(key) ? child : child.optional();
+    } else {
+      switch (resolvedSchema.type) {
+        case "string":
+          built = z.coerce.string();
+          break;
+        case "integer":
+          built = z.coerce.number().int();
+          break;
+        case "number":
+          built = z.coerce.number();
+          break;
+        case "boolean":
+          built = z.coerce.boolean();
+          break;
+        case "array": {
+          const itemSchema = this.mapSchemaToZod(resolvedSchema.items);
+          built = z.array(itemSchema);
+          break;
         }
+        case "object": {
+          const properties = resolvedSchema.properties ?? {};
+          const required = new Set(resolvedSchema.required ?? []);
+          const childShape: z.ZodRawShape = {};
 
-        const hasProperties = Object.keys(properties).length > 0;
-        const additional = resolvedSchema.additionalProperties;
-        const resolvedAdditional =
-          additional && typeof additional === "object" ? this.resolveSchema(additional) : undefined;
+          for (const [key, childSchema] of Object.entries(properties)) {
+            const child = this.mapSchemaToZod(childSchema);
+            childShape[key] = required.has(key) ? child : child.optional();
+          }
 
-        if (!hasProperties) {
+          const hasProperties = Object.keys(properties).length > 0;
+          const additional = resolvedSchema.additionalProperties;
+          const resolvedAdditional =
+            additional && typeof additional === "object" ? this.resolveSchema(additional) : undefined;
+
+          if (!hasProperties) {
+            if (this.isLooseObjectSchema(resolvedAdditional)) {
+              built = z.record(z.any());
+              break;
+            }
+            if (resolvedAdditional) {
+              built = z.record(this.mapSchemaToZod(resolvedAdditional));
+              break;
+            }
+            if (additional === true || additional === undefined) {
+              built = z.record(z.any());
+              break;
+            }
+            built = z.object({}).strict();
+            break;
+          }
+
+          const objectSchema = z.object(childShape);
           if (this.isLooseObjectSchema(resolvedAdditional)) {
-            return z.record(z.any());
+            built = objectSchema.catchall(z.any());
+            break;
           }
           if (resolvedAdditional) {
-            return z.record(this.mapSchemaToZod(resolvedAdditional));
+            built = objectSchema.catchall(this.mapSchemaToZod(resolvedAdditional));
+            break;
           }
-          if (additional === true || additional === undefined) {
-            return z.record(z.any());
+          if (additional === true) {
+            built = objectSchema.catchall(z.any());
+            break;
           }
-          return z.object({}).strict();
-        }
+          if (additional === false) {
+            built = objectSchema.strict();
+            break;
+          }
 
-        const objectSchema = z.object(childShape);
-        if (this.isLooseObjectSchema(resolvedAdditional)) {
-          return objectSchema.catchall(z.any());
+          built = objectSchema;
+          break;
         }
-        if (resolvedAdditional) {
-          return objectSchema.catchall(this.mapSchemaToZod(resolvedAdditional));
-        }
-        if (additional === true) {
-          return objectSchema.catchall(z.any());
-        }
-        if (additional === false) {
-          return objectSchema.strict();
-        }
-
-        return objectSchema;
+        default:
+          built = z.any();
+          break;
       }
-      default:
-        return z.any();
     }
+
+    if (cacheKey) {
+      this.zodSchemaCache.set(cacheKey, built);
+      this.inProgressZodCache.delete(cacheKey);
+    }
+    return built;
   }
 
   private selectRequestBodySchema(
@@ -258,6 +301,18 @@ export class SpecParser {
     const resolvedSchema = this.resolveSchema(schema);
     if (!resolvedSchema) {
       return {};
+    }
+
+    const cacheKey = this.getSchemaCacheKey(schema, resolvedSchema);
+    if (cacheKey) {
+      const cached = this.jsonSchemaCache.get(cacheKey);
+      if (cached) {
+        return cached;
+      }
+      if (this.inProgressJsonCache.has(cacheKey)) {
+        return {};
+      }
+      this.inProgressJsonCache.add(cacheKey);
     }
 
     const jsonSchema: Record<string, unknown> = {};
@@ -307,6 +362,10 @@ export class SpecParser {
       }
     }
 
+    if (cacheKey) {
+      this.jsonSchemaCache.set(cacheKey, jsonSchema);
+      this.inProgressJsonCache.delete(cacheKey);
+    }
     return jsonSchema;
   }
 
@@ -355,6 +414,40 @@ export class SpecParser {
     const schemaName = schema.$ref.replace("#/components/schemas/", "");
     const resolved = this.currentSpec?.components?.schemas?.[schemaName];
     return resolved ?? schema;
+  }
+
+  private getSchemaCacheKey(
+    sourceSchema: OpenApiSchema | undefined,
+    resolvedSchema: OpenApiSchema | undefined,
+  ): string | undefined {
+    if (sourceSchema?.$ref && sourceSchema.$ref.startsWith("#/components/schemas/")) {
+      return `ref:${sourceSchema.$ref}`;
+    }
+    const target = resolvedSchema ?? sourceSchema;
+    if (!target) {
+      return undefined;
+    }
+    return `obj:${this.getSchemaObjectId(target)}`;
+  }
+
+  private getSchemaObjectId(schema: OpenApiSchema): number {
+    const existing = this.schemaObjectIds.get(schema);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const next = this.schemaObjectIdSequence;
+    this.schemaObjectIdSequence += 1;
+    this.schemaObjectIds.set(schema, next);
+    return next;
+  }
+
+  private resetSchemaCaches(): void {
+    this.zodSchemaCache.clear();
+    this.jsonSchemaCache.clear();
+    this.inProgressZodCache.clear();
+    this.inProgressJsonCache.clear();
+    this.schemaObjectIds = new WeakMap<OpenApiSchema, number>();
+    this.schemaObjectIdSequence = 0;
   }
 
   private isLooseObjectSchema(schema?: OpenApiSchema): boolean {
